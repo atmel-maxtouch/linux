@@ -293,6 +293,22 @@ struct mxt_data {
 	bool updating_config;
 };
 
+#ifdef CONFIG_OF
+static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
+{
+	// TODO:
+	//
+	// platform related code parse : irq, reset, gpio, avdd, vdd from device tree
+
+	return 0;
+}
+#else
+static int mxt_parse_dt(struct device *dev, struct mxt_platform_data *pdata)
+{
+	return -ENODEV;
+}
+#endif
+
 static size_t mxt_obj_size(const struct mxt_object *obj)
 {
 	return obj->size_minus_one + 1;
@@ -2454,6 +2470,14 @@ static int mxt_configure_objects(struct mxt_data *data)
 	return 0;
 }
 
+/* Configuration crc check sum is returned as hex xxxxxx */
+static ssize_t mxt_config_csum_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	return scnprintf(buf, PAGE_SIZE, "%06x\n", data->config_crc);
+}
+
 /* Firmware Version is returned as Major.Minor.Build */
 static ssize_t mxt_fw_version_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
@@ -2895,6 +2919,7 @@ static DEVICE_ATTR(debug_v2_enable, S_IWUSR | S_IRUSR, NULL,
 static DEVICE_ATTR(debug_notify, S_IRUGO, mxt_debug_notify_show, NULL);
 static DEVICE_ATTR(debug_enable, S_IWUSR | S_IRUSR, mxt_debug_enable_show,
 		   mxt_debug_enable_store);
+static DEVICE_ATTR(config_csum, S_IRUGO, mxt_config_csum_show, NULL);
 
 static struct attribute *mxt_attrs[] = {
 	&dev_attr_fw_version.attr,
@@ -2905,6 +2930,7 @@ static struct attribute *mxt_attrs[] = {
 	&dev_attr_debug_enable.attr,
 	&dev_attr_debug_v2_enable.attr,
 	&dev_attr_debug_notify.attr,
+	&dev_attr_config_csum.attr,
 	NULL
 };
 
@@ -2987,7 +3013,7 @@ static void mxt_input_close(struct input_dev *dev)
 	mxt_stop(data);
 }
 
-static int mxt_handle_pdata(struct mxt_data *data)
+static int mxt_handle_pdata(struct device *dev, struct mxt_data *data)
 {
 	data->pdata = dev_get_platdata(&data->client->dev);
 
@@ -3006,6 +3032,13 @@ static int mxt_handle_pdata(struct mxt_data *data)
 	if (!data->pdata) {
 		dev_err(&data->client->dev, "Failed to allocate pdata\n");
 		return -ENOMEM;
+	}
+
+	/* Check device tree node */
+	if (data->client->dev.of_node) {
+		error = mxt_parse_dt(dev, data->pdata);
+		if (error)
+			return error;
 	}
 
 	/* Set default parameters */
@@ -3146,7 +3179,7 @@ static int mxt_probe(struct i2c_client *client,
 	data->irq = client->irq;
 	i2c_set_clientdata(client, data);
 
-	error = mxt_handle_pdata(data);
+	error = mxt_handle_pdata(&client->dev, data);
 	if (error)
 		goto err_free_mem;
 
@@ -3272,12 +3305,21 @@ static const struct i2c_device_id mxt_id[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, mxt_id);
+#ifdef CONFIG_OF
+static struct of_device_id mxt_match_table[] = {
+	{ .compatible = "atmel,mxt-ts",},
+	{ },
+};
+#else
+#define mxt_match_table NULL
+#endif
 
 static struct i2c_driver mxt_driver = {
 	.driver = {
 		.name	= "atmel_mxt_ts",
 		.owner	= THIS_MODULE,
 		.pm	= &mxt_pm_ops,
+		.of_match_table = mxt_match_table,
 	},
 	.probe		= mxt_probe,
 	.remove		= mxt_remove,
