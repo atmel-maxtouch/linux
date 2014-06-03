@@ -54,6 +54,7 @@
 #include <linux/init.h>
 #include <linux/usb.h>
 #include <linux/usb/input.h>
+#include <linux/input/mt.h>
 #include <linux/hid.h>
 
 
@@ -142,7 +143,10 @@ enum {
 	DEVTYPE_NEXIO,
 	DEVTYPE_ELO,
 	DEVTYPE_ETOUCH,
+	DEVTYPE_GE_STAR,
 };
+
+static struct usbtouch_device_info usbtouch_dev_info[];
 
 #define USB_DEVICE_HID_CLASS(vend, prod) \
 	.match_flags = USB_DEVICE_ID_MATCH_INT_CLASS \
@@ -250,6 +254,8 @@ static const struct usb_device_id usbtouch_devices[] = {
 #ifdef CONFIG_TOUCHSCREEN_USB_EASYTOUCH
 	{USB_DEVICE(0x7374, 0x0001), .driver_info = DEVTYPE_ETOUCH},
 #endif
+
+	{USB_DEVICE(0x238f, 0x0001), .driver_info = DEVTYPE_GE_STAR},
 
 	{}
 };
@@ -1065,6 +1071,85 @@ static int elo_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 
 
 /*****************************************************************************
+ * Gleichmann Star Touch driver part
+ */
+
+#ifdef CONFIG_TOUCHSCREEN_USB_GE_STAR
+
+#define MAX_NUM_TOUCHES 16
+
+static int ge_star_init(struct usbtouch_usb *usbtouch)
+{
+	struct input_dev *input_dev = usbtouch->input;
+	int error;
+
+	if (usbtouch->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
+		/* For multi touch */
+		error = input_mt_init_slots(input_dev, MAX_NUM_TOUCHES, 0);
+		if (error)
+			return -ENOMEM;
+
+		input_set_abs_params(input_dev, ABS_MT_POSITION_X,
+				     usbtouch_dev_info[DEVTYPE_GE_STAR].min_xc,
+				     usbtouch_dev_info[DEVTYPE_GE_STAR].max_xc,
+				     0, 0);
+		input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
+				     usbtouch_dev_info[DEVTYPE_GE_STAR].min_yc,
+				     usbtouch_dev_info[DEVTYPE_GE_STAR].max_yc,
+				     0, 0);
+	}
+	return 0;
+}
+
+static void ge_star_exit(struct usbtouch_usb *usbtouch)
+{
+}
+
+static int ge_star_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
+{
+	dev->x = (pkt[4] << 8) | pkt[3];
+	dev->y = (pkt[6] << 8) | pkt[5];
+
+	/* Touch number */
+	dev->touch = (pkt[1] & 0xF0) >> 4;
+
+	switch (pkt[1] & 0x0F) {
+	case 0x07: /* Press detected */
+		dev->press = 1;
+		break;
+
+	case 0x06: /* Release detected */
+		dev->press = 0;
+		break;
+	}
+	return 1;
+}
+
+static void ge_star_process_pkt(struct usbtouch_usb *usbtouch,
+				unsigned char *pkt, int len)
+{
+	struct usbtouch_device_info *type = usbtouch->type;
+
+	if (!type->read_data(usbtouch, pkt))
+		return;
+
+	input_mt_slot(usbtouch->input, usbtouch->touch);
+	input_mt_report_slot_state(usbtouch->input, MT_TOOL_FINGER,
+				   usbtouch->press);
+
+	input_report_abs(usbtouch->input, ABS_MT_POSITION_X, usbtouch->x);
+	input_report_abs(usbtouch->input, ABS_MT_POSITION_Y, usbtouch->y);
+
+	input_report_abs(usbtouch->input, ABS_X, usbtouch->x);
+	input_report_abs(usbtouch->input, ABS_Y, usbtouch->y);
+
+	input_report_key(usbtouch->input, BTN_TOUCH, usbtouch->press);
+
+	input_sync(usbtouch->input);
+}
+#endif
+
+/*****************************************************************************
  * the different device descriptors
  */
 #ifdef MULTI_PACKET
@@ -1282,6 +1367,21 @@ static struct usbtouch_device_info usbtouch_dev_info[] = {
 		.process_pkt	= usbtouch_process_multi,
 		.get_pkt_len	= etouch_get_pkt_len,
 		.read_data	= etouch_read_data,
+	},
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_USB_GE_STAR
+	[DEVTYPE_GE_STAR] = {
+		.min_xc		= 0x0,
+		.max_xc		= 0x0fff,
+		.min_yc		= 0x0,
+		.max_yc		= 0x0fff,
+		.max_press	= 0xff,
+		.rept_size	= 8,
+		.init		= ge_star_init,
+		.exit		= ge_star_exit,
+		.process_pkt	= ge_star_process_pkt,
+		.read_data	= ge_star_read_data,
 	},
 #endif
 };

@@ -790,6 +790,14 @@ config TOUCHSCREEN_USB_EASYTOUCH
 	  Say Y here if you have an EasyTouch USB Touch controller.
 	  If unsure, say N.
 
+config TOUCHSCREEN_USB_GE_STAR
+	default y
+	bool "GE Star Touch controller device support"
+	depends on TOUCHSCREEN_USB_COMPOSITE
+	help
+	  Say Y here if you have an Gleichmann Star USB Touch controller.
+	  If unsure, say N.
+
 config TOUCHSCREEN_TOUCHIT213
 	tristate "Sahara TouchIT-213 touchscreen"
 	select SERIO
