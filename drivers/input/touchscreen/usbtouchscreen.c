@@ -1069,6 +1069,14 @@ static int elo_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 }
 #endif
 
+struct ge_star_priv {
+	struct usb_device	*usbdev;
+	struct urb		*util;
+	struct usb_ctrlrequest	uctrl;
+	uint16_t		status;
+	uint8_t			data[5];
+	struct completion	ucompl_done;
+};
 
 /*****************************************************************************
  * Gleichmann Star Touch driver part
@@ -1078,9 +1086,94 @@ static int elo_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 
 #define MAX_NUM_TOUCHES 16
 
+/* Callback function */
+static void ge_star_ctrl_callback(struct urb *urb)
+{
+}
+
+static ssize_t ge_star_status(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct usbtouch_usb *usbtouch = usb_get_intfdata(intf);
+	struct ge_star_priv *priv = usbtouch->priv;
+	unsigned int ctrl_pipe;
+
+	if (!intf || !usbtouch || !priv)
+		return -EIO;
+
+	priv->uctrl.bRequestType = 0x20;
+	priv->uctrl.bRequest = 0;
+	priv->uctrl.wValue = 0;
+	priv->uctrl.wIndex = 0;
+	priv->uctrl.wLength = 5;
+
+	priv->data[0] = 0x0a;
+	priv->data[1] = 0x03;
+	priv->data[2] = 0x52;
+	priv->data[3] = 0x07;
+	priv->data[4] = 0x01;
+
+	init_completion(&priv->ucompl_done);
+
+	ctrl_pipe = usb_sndctrlpipe(priv->usbdev, 0);
+
+	usb_fill_control_urb(priv->util, priv->usbdev, ctrl_pipe,
+			     (char *) &priv->uctrl, priv->data, 5,
+			     ge_star_ctrl_callback, NULL);
+
+	usb_submit_urb(priv->util, GFP_ATOMIC);
+
+	wait_for_completion(&priv->ucompl_done);
+
+	return scnprintf(buf, PAGE_SIZE, "%04X\n", priv->status);
+}
+
+static DEVICE_ATTR(touch_status, S_IRUGO, ge_star_status, NULL);
+
+static struct attribute *ge_star_attrs[] = {
+	&dev_attr_touch_status.attr,
+	NULL
+};
+
+static const struct attribute_group ge_star_attr_group = {
+	.attrs = ge_star_attrs,
+};
+
+static int ge_star_alloc(struct usbtouch_usb *usbtouch)
+{
+	struct ge_star_priv *priv;
+	int ret = -ENOMEM;
+
+	if (usbtouch->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
+		usbtouch->priv = kmalloc(sizeof(struct ge_star_priv),
+					 GFP_KERNEL);
+		if (!usbtouch->priv)
+			goto out_buf;
+
+		priv = usbtouch->priv;
+		priv->status = 0xABCD; /* A init value no meaning */
+		priv->util = usb_alloc_urb(0, GFP_KERNEL);
+		if (!priv->util) {
+			dev_dbg(&usbtouch->interface->dev,
+				"%s - usb_alloc_urb failed: usbtouch->irq\n",
+				__func__);
+			goto out_free_buffers;
+		}
+	}
+	return 0;
+
+out_free_buffers:
+	kfree(priv);
+out_buf:
+	return ret;
+}
+
 static int ge_star_init(struct usbtouch_usb *usbtouch)
 {
+	struct device *dev = &usbtouch->interface->dev;
 	struct input_dev *input_dev = usbtouch->input;
+	struct ge_star_priv *priv;
 	int error;
 
 	if (usbtouch->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
@@ -1097,32 +1190,60 @@ static int ge_star_init(struct usbtouch_usb *usbtouch)
 				     usbtouch_dev_info[DEVTYPE_GE_STAR].min_yc,
 				     usbtouch_dev_info[DEVTYPE_GE_STAR].max_yc,
 				     0, 0);
+		priv = usbtouch->priv;
+		priv->usbdev = interface_to_usbdev(usbtouch->interface);
+
+		error = sysfs_create_group(&dev->kobj, &ge_star_attr_group);
+		if (error)
+			goto err_unregister_device;
 	}
 	return 0;
+
+err_unregister_device:
+	return error;
 }
 
 static void ge_star_exit(struct usbtouch_usb *usbtouch)
 {
+	struct device *dev = &usbtouch->interface->dev;
+	struct ge_star_priv *priv = usbtouch->priv;
+
+	if (usbtouch->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
+		usb_kill_urb(priv->util);
+		usb_free_urb(priv->util);
+		kfree(priv);
+		sysfs_remove_group(&dev->kobj, &ge_star_attr_group);
+	}
 }
 
-static int ge_star_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
+static int ge_star_read_data(struct usbtouch_usb *usbtouch, unsigned char *pkt)
 {
-	dev->x = (pkt[4] << 8) | pkt[3];
-	dev->y = (pkt[6] << 8) | pkt[5];
+	struct ge_star_priv *priv = usbtouch->priv;
 
-	/* Touch number */
-	dev->touch = (pkt[1] & 0xF0) >> 4;
+	if (pkt[0] == 0x01) {
+		usbtouch->x = (pkt[4] << 8 | pkt[3]);
+		usbtouch->y = (pkt[6] << 8) | pkt[5];
+		usbtouch->touch = (pkt[1] & 0xF0) >> 4; /* Touch number */
 
-	switch (pkt[1] & 0x0F) {
-	case 0x07: /* Press detected */
-		dev->press = 1;
-		break;
+		switch (pkt[1] & 0x0F) {
+		case 0x07: /* Press detected */
+			usbtouch->press = 1;
+			break;
 
-	case 0x06: /* Release detected */
-		dev->press = 0;
-		break;
+		case 0x06: /* Release detected */
+			usbtouch->press = 0;
+			break;
+		}
+		return 1;
+	} else if ((pkt[0] == 0x06)) {
+		/* The status response is interpreted*/
+		if ((pkt[1] == 0x72) && (pkt[2] == 0x07) && (pkt[3] == 0x01)) {
+			priv->status = ((pkt[5] << 8)|pkt[4]);
+			complete(&priv->ucompl_done);
+		}
+		return 0;
 	}
-	return 1;
+	return 0;
 }
 
 static void ge_star_process_pkt(struct usbtouch_usb *usbtouch,
@@ -1378,6 +1499,7 @@ static struct usbtouch_device_info usbtouch_dev_info[] = {
 		.max_yc		= 0x0fff,
 		.max_press	= 0xff,
 		.rept_size	= 8,
+		.alloc		= ge_star_alloc,
 		.init		= ge_star_init,
 		.exit		= ge_star_exit,
 		.process_pkt	= ge_star_process_pkt,
