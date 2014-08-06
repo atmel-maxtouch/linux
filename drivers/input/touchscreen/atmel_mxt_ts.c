@@ -859,9 +859,26 @@ static void mxt_input_button(struct mxt_data *data, u8 *message)
 
 static void mxt_input_sync(struct mxt_data *data)
 {
-	input_mt_report_pointer_emulation(data->input_dev,
-					  data->pdata->t19_num_keys);
-	input_sync(data->input_dev);
+
+    /* Because mxt_update_cfg() will invoke mxt_free_input_device() and 
+     *   it will nullify data->input_dev, if there's an interrupt (such
+     *   as T6 CFG_ERR, it will trigger mxt_interrupt() and this
+     *   __function__ will be invoked.
+     *   If we don't test the nullity of data->input_dev, this __function__
+     *   will cause kernel panic for referencing data->input_dev.
+     */
+    if( data->input_dev == NULL )
+    {
+        struct device *dev = &data->client->dev;
+        dev_info(dev, "data->input_dev is NULL\n");
+    }
+    else
+    {
+        input_mt_report_pointer_emulation(data->input_dev,
+                                          data->pdata->t19_num_keys);
+        input_sync(data->input_dev);
+    }
+
 }
 
 static void mxt_proc_t9_message(struct mxt_data *data, u8 *message)
