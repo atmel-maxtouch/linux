@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/regulator/consumer.h>
 #include <linux/gpio.h>
+#include <linux/input.h>
 #ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
 #endif
@@ -2427,6 +2428,9 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 	input_dev->close = mxt_input_close;
 
 	set_bit(EV_ABS, input_dev->evbit);
+#ifdef INPUT_PROP_DIRECT
+	set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+#endif
 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 
 	/* For single touch */
@@ -2598,6 +2602,14 @@ err_free_object_table:
 /* Configuration crc check sum is returned as hex xxxxxx */
 static ssize_t mxt_config_csum_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	return scnprintf(buf, PAGE_SIZE, "%06x\n", data->config_crc);
+}
+
+/* Configuration crc check sum is returned as hex xxxxxx */
+static ssize_t mxt_config_csum_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
 	return scnprintf(buf, PAGE_SIZE, "%06x\n", data->config_crc);
