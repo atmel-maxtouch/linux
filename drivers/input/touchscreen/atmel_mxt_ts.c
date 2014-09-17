@@ -27,7 +27,13 @@
 #include <linux/slab.h>
 #include <linux/regulator/consumer.h>
 #include <linux/gpio.h>
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#include <linux/input.h>
+
+#if defined(CONFIG_FB)
+#include <linux/notifier.h>
+#include <linux/fb.h>
+
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 #include <linux/earlysuspend.h>
 #endif
 
@@ -35,6 +41,10 @@
 #include <linux/of_gpio.h>
 #endif
 
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(3, 6, 8))
+#define KERNEL_3_6_8_ABOVE
+#endif
 /* Configuration file */
 #define MXT_CFG_MAGIC		"OBP_RAW V1"
 
@@ -222,7 +232,11 @@ struct mxt_object {
 	u8 num_report_ids;
 } __packed;
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+static int fb_notifier_callback(struct notifier_block *self,
+	unsigned long event, void *fdata);
+
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 static void mxt_early_suspend(struct early_suspend *es);
 static void mxt_late_resume(struct early_suspend *es);
 #endif
@@ -291,7 +305,9 @@ struct mxt_data {
 	u8 T100_reportid_min;
 	u8 T100_reportid_max;
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+	struct notifier_block fb_notif;
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 	struct early_suspend early_suspend;
 #endif
 
@@ -993,6 +1009,8 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 
 		/* Touch active */
 		input_mt_report_slot_state(input_dev, tool, 1);
+		input_report_key(input_dev, BTN_TOUCH, 1);
+		input_report_key(input_dev, BTN_TOOL_FINGER, 1);
 		input_report_abs(input_dev, ABS_MT_POSITION_X, x);
 		input_report_abs(input_dev, ABS_MT_POSITION_Y, y);
 
@@ -2179,8 +2197,8 @@ static int mxt_read_t9_resolution(struct mxt_data *data)
 	return 0;
 }
 
-static void mxt_start(struct mxt_data *data);
-static void mxt_stop(struct mxt_data *data);
+static int mxt_start(struct mxt_data *data);
+static int mxt_stop(struct mxt_data *data);
 static int mxt_input_open(struct input_dev *dev);
 static void mxt_input_close(struct input_dev *dev);
 
@@ -2247,7 +2265,11 @@ static int mxt_initialize_t9_input_device(struct mxt_data *data)
 
 	/* For multi touch */
 	num_mt_slots = data->num_touchids + data->num_stylusids;
+#ifdef KERNEL_3_6_8_ABOVE
+	error = input_mt_init_slots(input_dev, num_mt_slots, INPUT_MT_DIRECT);
+#else
 	error = input_mt_init_slots(input_dev, num_mt_slots);
+#endif
 	if (error) {
 		dev_err(dev, "Error %d initialising slots\n", error);
 		goto err_free_mem;
@@ -2404,6 +2426,9 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 	input_dev->close = mxt_input_close;
 
 	set_bit(EV_ABS, input_dev->evbit);
+#ifdef INPUT_PROP_DIRECT
+	set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+#endif
 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 
 	/* For single touch */
@@ -2417,7 +2442,11 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 				     0, 255, 0, 0);
 
 	/* For multi touch */
+#ifdef KERNEL_3_6_8_ABOVE
+	error = input_mt_init_slots(input_dev, data->num_touchids, INPUT_MT_DIRECT);
+#else
 	error = input_mt_init_slots(input_dev, data->num_touchids);
+#endif
 	if (error) {
 		dev_err(dev, "Error %d initialising slots\n", error);
 		goto err_free_mem;
@@ -3149,10 +3178,12 @@ static void mxt_reset_slots(struct mxt_data *data)
 	mxt_input_sync(data);
 }
 
-static void mxt_start(struct mxt_data *data)
+static int mxt_start(struct mxt_data *data)
 {
+	int error = 0;
+
 	if (!data->suspended || data->in_bootloader)
-		return;
+		return 0;
 
 	if (data->use_regulator) {
 		enable_irq(data->irq);
@@ -3165,7 +3196,7 @@ static void mxt_start(struct mxt_data *data)
 		 */
 		mxt_process_messages_until_invalid(data);
 
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
+		error = mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
 
 		/* Recalibrate since chip has been in deep sleep */
 		mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
@@ -3174,22 +3205,28 @@ static void mxt_start(struct mxt_data *data)
 	}
 
 	data->suspended = false;
+
+	return error;
 }
 
-static void mxt_stop(struct mxt_data *data)
+static int mxt_stop(struct mxt_data *data)
 {
+	int error = 0;
+
 	if (data->suspended || data->in_bootloader || data->updating_config)
-		return;
+		return 0;
 
 	disable_irq(data->irq);
 
 	if (data->use_regulator)
 		mxt_regulator_disable(data);
 	else
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
+		error =	mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
 
 	mxt_reset_slots(data);
 	data->suspended = true;
+
+	return error;
 }
 
 static int mxt_input_open(struct input_dev *dev)
@@ -3343,7 +3380,15 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		goto err_remove_sysfs_group;
 	}
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+	data->fb_notif.notifier_call = fb_notifier_callback;
+
+	error = fb_register_client(&data->fb_notif);
+
+	if (error)
+		dev_err(&client->dev, "Unable to register fb_notifier: %d\n",error);
+
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 	data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	data->early_suspend.suspend = mxt_early_suspend;
 	data->early_suspend.resume = mxt_late_resume;
@@ -3372,7 +3417,10 @@ static int mxt_remove(struct i2c_client *client)
 {
 	struct mxt_data *data = i2c_get_clientdata(client);
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+        if (fb_unregister_client(&data->fb_notif))
+                dev_err(&client->dev, "Error occurred while unregistering fb_notifier.\n");
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 	unregister_early_suspend(&data->early_suspend);
 #endif
 
@@ -3424,7 +3472,29 @@ static int mxt_resume(struct device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+static int fb_notifier_callback(struct notifier_block *self,
+                                 unsigned long event, void *fdata)
+{
+        struct fb_event *evdata = fdata;
+        int *blank;
+        struct mxt_data *data =
+                container_of(self, struct mxt_data, fb_notif);
+
+        if (evdata && evdata->data && event == FB_EVENT_BLANK && data &&
+                        data->client) {
+                blank = evdata->data;
+                if (*blank == FB_BLANK_UNBLANK) {
+                        mxt_resume(&data->client->dev);
+		}
+                else if (*blank == FB_BLANK_POWERDOWN)
+                        mxt_suspend(&data->client->dev);
+        }
+
+        return 0;
+}
+
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 static void mxt_early_suspend(struct early_suspend *es)
 {
 	struct mxt_data *mxt;
@@ -3442,11 +3512,17 @@ static void mxt_late_resume(struct early_suspend *es)
 	if (mxt_resume(&mxt->client->dev) != 0)
 		dev_err(&mxt->client->dev, "%s: failed\n", __func__);
 }
-#endif
+
 
 #endif
 
-static SIMPLE_DEV_PM_OPS(mxt_pm_ops, mxt_suspend, mxt_resume);
+static const struct dev_pm_ops mxt_pm_ops = {
+#if (!defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND))
+        .suspend        = mxt_suspend,
+        .resume         = mxt_resume,
+#endif
+};
+#endif
 
 #ifdef CONFIG_OF
 static const struct of_device_id mxt_of_match[] = {
